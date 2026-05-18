@@ -1,0 +1,14 @@
+[project]
+name = "inkline"
+version = "0.1.0"
+description = "Inkline desktop editor"
+requires-python = ">=3.14"
+
+[project.scripts]
+inkline = "inkline.main:main"
+
+[project.optional-dependencies]
+build = ["pyinstaller>=6.0"]
+
+[tool.inkline]
+build_script = "tools/build_app.py"

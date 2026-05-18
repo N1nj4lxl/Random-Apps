@@ -1,5 +1,34 @@
 # Inkline
 
+Simple notes, sharper tools.
+
+## Run locally
+
+```bash
+python -m inkline.main
+```
+
+## Compile a desktop executable
+
+Install build dependency:
+
+```bash
+python -m pip install pyinstaller
+```
+
+Build app bundle:
+
+```bash
+python tools/build_app.py
+```
+
+Build single-file executable:
+
+```bash
+python tools/build_app.py --onefile
+```
+
+Output is written to `dist/`.
 **Simple notes, sharper tools.**
 
 Inkline is a modern lightweight desktop text editor built in **Python 3.14 using Tkinter**. Inspired by Windows Notepad, Inkline expands the classic experience with modern themes, workspaces, organisation tools, advanced editing systems, and developer-focused utilities while remaining fast, clean, and lightweight.
