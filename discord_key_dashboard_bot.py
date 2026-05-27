@@ -16,6 +16,7 @@ class KeyDistributor:
         self.claimed: dict[int, list[str]] = defaultdict(list)
         self.allowed_users: set[int] = set()
         self.default_count = 1
+        self.custom_commands: dict[str, str] = {}
         self.lock = threading.Lock()
 
     def load_keys_from_file(self, file_path: str):
@@ -32,6 +33,7 @@ class KeyDistributor:
                 "remaining_keys": self.keys,
                 "allowed_users": sorted(self.allowed_users),
                 "default_count": self.default_count,
+                "custom_commands": self.custom_commands,
                 "claimed": {str(uid): vals for uid, vals in self.claimed.items()},
             }
         Path(file_path).write_text(json.dumps(data, indent=2), encoding="utf-8")
@@ -42,10 +44,37 @@ class KeyDistributor:
             self.keys = list(data.get("remaining_keys", []))
             self.allowed_users = {int(u) for u in data.get("allowed_users", [])}
             self.default_count = int(data.get("default_count", 1))
+            loaded_commands = data.get("custom_commands", {})
+            self.custom_commands = {
+                self._normalize_command_name(name): str(response)
+                for name, response in loaded_commands.items()
+                if self._normalize_command_name(name) and str(response).strip()
+            }
             restored = defaultdict(list)
             for uid, vals in data.get("claimed", {}).items():
                 restored[int(uid)] = list(vals)
             self.claimed = restored
+
+    @staticmethod
+    def _normalize_command_name(name: str) -> str:
+        clean = "".join(ch for ch in name.strip().lower() if ch.isalnum() or ch == "_")
+        return clean
+
+    def upsert_custom_command(self, name: str, response: str) -> str:
+        normalized = self._normalize_command_name(name)
+        if not normalized:
+            raise ValueError("Command name must contain letters, numbers, or underscores.")
+        reply = response.strip()
+        if not reply:
+            raise ValueError("Command response cannot be empty.")
+        with self.lock:
+            self.custom_commands[normalized] = reply
+        return normalized
+
+    def remove_custom_command(self, name: str) -> bool:
+        normalized = self._normalize_command_name(name)
+        with self.lock:
+            return self.custom_commands.pop(normalized, None) is not None
 
     def add_allowed_user(self, user_id: int):
         with self.lock:
@@ -84,6 +113,7 @@ class BotController:
         self.loop = None
         self.thread = None
         self.bot = None
+        self.custom_command_names: set[str] = set()
         self.running = False
 
     def _build_bot(self, prefix: str):
@@ -115,7 +145,31 @@ class BotController:
 
             self.log_cb(f"Gave {len(keys)} key(s) to {ctx.author} ({ctx.author.id})")
 
+        self._register_custom_commands(bot)
         return bot
+
+    def _register_custom_commands(self, bot):
+        for command_name in list(self.custom_command_names):
+            cmd = bot.get_command(command_name)
+            if cmd:
+                bot.remove_command(command_name)
+        self.custom_command_names.clear()
+
+        for command_name, response in self.distributor.custom_commands.items():
+            async def custom_reply(ctx, text=response):
+                await ctx.reply(text)
+
+            bot.command(name=command_name)(custom_reply)
+            self.custom_command_names.add(command_name)
+
+    def sync_custom_commands(self):
+        if not self.running or not self.bot or not self.loop:
+            return
+
+        def apply_changes():
+            self._register_custom_commands(self.bot)
+
+        self.loop.call_soon_threadsafe(apply_changes)
 
     def start(self, token: str, prefix: str):
         if self.running:
@@ -167,6 +221,8 @@ class Dashboard:
         self.prefix_var = tk.StringVar(value="!")
         self.default_count_var = tk.StringVar(value="1")
         self.user_id_var = tk.StringVar()
+        self.command_name_var = tk.StringVar()
+        self.command_response_var = tk.StringVar()
 
         self._build_ui()
         self.refresh_lists()
@@ -214,6 +270,22 @@ class Dashboard:
         self.users_list = tk.Listbox(right)
         self.users_list.pack(fill="both", expand=True)
 
+        commands_frame = ttk.LabelFrame(mid, text="Custom Commands", padding=8)
+        commands_frame.pack(side="left", fill="both", expand=True, padx=(8, 0))
+
+        ttk.Label(commands_frame, text="Command name (without prefix):").pack(anchor="w")
+        ttk.Entry(commands_frame, textvariable=self.command_name_var).pack(fill="x", pady=(0, 6))
+        ttk.Label(commands_frame, text="Reply message:").pack(anchor="w")
+        ttk.Entry(commands_frame, textvariable=self.command_response_var).pack(fill="x", pady=(0, 8))
+
+        command_buttons = ttk.Frame(commands_frame)
+        command_buttons.pack(fill="x", pady=(0, 8))
+        ttk.Button(command_buttons, text="Create / Update", command=self.add_or_update_command).pack(side="left", padx=(0, 6))
+        ttk.Button(command_buttons, text="Remove", command=self.remove_command).pack(side="left")
+
+        self.commands_list = tk.Listbox(commands_frame)
+        self.commands_list.pack(fill="both", expand=True)
+
         bottom = ttk.LabelFrame(wrapper, text="State & Logs", padding=8)
         bottom.pack(fill="both", expand=True, pady=(10, 0))
 
@@ -242,6 +314,10 @@ class Dashboard:
         self.users_list.delete(0, "end")
         for uid in sorted(self.dist.allowed_users):
             self.users_list.insert("end", str(uid))
+
+        self.commands_list.delete(0, "end")
+        for name, response in sorted(self.dist.custom_commands.items()):
+            self.commands_list.insert("end", f"{name} -> {response}")
 
         s = self.dist.summary()
         self.stats_label.config(
@@ -291,6 +367,25 @@ class Dashboard:
             self.log(f"Saved state to {path}")
         except Exception as exc:
             messagebox.showerror("Error", str(exc))
+
+    def add_or_update_command(self):
+        try:
+            command_name = self.dist.upsert_custom_command(
+                self.command_name_var.get(),
+                self.command_response_var.get(),
+            )
+            self.controller.sync_custom_commands()
+            self.log(f"Saved custom command '{command_name}'")
+        except ValueError as exc:
+            messagebox.showwarning("Input Error", str(exc))
+
+    def remove_command(self):
+        removed = self.dist.remove_custom_command(self.command_name_var.get())
+        if removed:
+            self.controller.sync_custom_commands()
+            self.log(f"Removed custom command '{self.command_name_var.get().strip()}'")
+            return
+        messagebox.showwarning("Not Found", "That command does not exist.")
 
     def load_state(self):
         path = filedialog.askopenfilename(filetypes=[("JSON", "*.json"), ("All files", "*.*")])
