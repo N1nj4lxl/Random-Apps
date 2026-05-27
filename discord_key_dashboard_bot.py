@@ -1,0 +1,325 @@
+import asyncio
+import json
+import threading
+from collections import defaultdict
+from pathlib import Path
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
+
+import discord
+from discord.ext import commands
+
+
+class KeyDistributor:
+    def __init__(self):
+        self.keys: list[str] = []
+        self.claimed: dict[int, list[str]] = defaultdict(list)
+        self.allowed_users: set[int] = set()
+        self.default_count = 1
+        self.lock = threading.Lock()
+
+    def load_keys_from_file(self, file_path: str):
+        path = Path(file_path)
+        lines = path.read_text(encoding="utf-8").splitlines()
+        clean = [line.strip() for line in lines if line.strip()]
+        deduped = list(dict.fromkeys(clean))
+        with self.lock:
+            self.keys = deduped
+
+    def save_state(self, file_path: str):
+        with self.lock:
+            data = {
+                "remaining_keys": self.keys,
+                "allowed_users": sorted(self.allowed_users),
+                "default_count": self.default_count,
+                "claimed": {str(uid): vals for uid, vals in self.claimed.items()},
+            }
+        Path(file_path).write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+    def load_state(self, file_path: str):
+        data = json.loads(Path(file_path).read_text(encoding="utf-8"))
+        with self.lock:
+            self.keys = list(data.get("remaining_keys", []))
+            self.allowed_users = {int(u) for u in data.get("allowed_users", [])}
+            self.default_count = int(data.get("default_count", 1))
+            restored = defaultdict(list)
+            for uid, vals in data.get("claimed", {}).items():
+                restored[int(uid)] = list(vals)
+            self.claimed = restored
+
+    def add_allowed_user(self, user_id: int):
+        with self.lock:
+            self.allowed_users.add(user_id)
+
+    def remove_allowed_user(self, user_id: int):
+        with self.lock:
+            self.allowed_users.discard(user_id)
+
+    def give_keys(self, user_id: int, count: int | None = None) -> list[str]:
+        with self.lock:
+            if user_id not in self.allowed_users:
+                return []
+            n = count if count is not None else self.default_count
+            n = max(1, n)
+            if not self.keys:
+                return []
+            given = self.keys[:n]
+            self.keys = self.keys[n:]
+            self.claimed[user_id].extend(given)
+            return given
+
+    def summary(self):
+        with self.lock:
+            return {
+                "remaining": len(self.keys),
+                "allowed_count": len(self.allowed_users),
+                "claimed_total": sum(len(v) for v in self.claimed.values()),
+            }
+
+
+class BotController:
+    def __init__(self, distributor: KeyDistributor, log_cb):
+        self.distributor = distributor
+        self.log_cb = log_cb
+        self.loop = None
+        self.thread = None
+        self.bot = None
+        self.running = False
+
+    def _build_bot(self, prefix: str):
+        intents = discord.Intents.default()
+        intents.message_content = True
+        bot = commands.Bot(command_prefix=prefix, intents=intents)
+
+        @bot.event
+        async def on_ready():
+            self.log_cb(f"Logged in as {bot.user} (ID: {bot.user.id})")
+
+        @bot.command(name="getkeys")
+        async def get_keys(ctx, count: int | None = None):
+            user_id = ctx.author.id
+            keys = self.distributor.give_keys(user_id, count)
+            if not keys:
+                if user_id not in self.distributor.allowed_users:
+                    await ctx.reply("You are not allowed to receive keys.")
+                else:
+                    await ctx.reply("No keys are available right now.")
+                return
+
+            joined = "\n".join(keys)
+            try:
+                await ctx.author.send(f"Your keys:\n{joined}")
+                await ctx.reply(f"Sent {len(keys)} key(s) to your DM.")
+            except discord.Forbidden:
+                await ctx.reply("I can't DM you. Please open your DMs and try again.")
+
+            self.log_cb(f"Gave {len(keys)} key(s) to {ctx.author} ({ctx.author.id})")
+
+        return bot
+
+    def start(self, token: str, prefix: str):
+        if self.running:
+            self.log_cb("Bot is already running.")
+            return
+
+        def runner():
+            self.loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(self.loop)
+            self.bot = self._build_bot(prefix)
+            self.running = True
+            try:
+                self.loop.run_until_complete(self.bot.start(token))
+            except Exception as exc:
+                self.log_cb(f"Bot crashed: {exc}")
+            finally:
+                self.running = False
+
+        self.thread = threading.Thread(target=runner, daemon=True)
+        self.thread.start()
+        self.log_cb("Bot thread started.")
+
+    def stop(self):
+        if not self.running or not self.bot or not self.loop:
+            self.log_cb("Bot is not running.")
+            return
+
+        async def shutdown():
+            await self.bot.close()
+
+        fut = asyncio.run_coroutine_threadsafe(shutdown(), self.loop)
+        try:
+            fut.result(timeout=10)
+            self.log_cb("Bot stopped.")
+        except Exception as exc:
+            self.log_cb(f"Failed to stop bot cleanly: {exc}")
+
+
+class Dashboard:
+    def __init__(self, root: tk.Tk):
+        self.root = root
+        self.root.title("Discord Key Distributor Dashboard")
+        self.root.geometry("950x640")
+
+        self.dist = KeyDistributor()
+        self.controller = BotController(self.dist, self.log)
+
+        self.token_var = tk.StringVar()
+        self.prefix_var = tk.StringVar(value="!")
+        self.default_count_var = tk.StringVar(value="1")
+        self.user_id_var = tk.StringVar()
+
+        self._build_ui()
+        self.refresh_lists()
+
+    def _build_ui(self):
+        wrapper = ttk.Frame(self.root, padding=10)
+        wrapper.pack(fill="both", expand=True)
+
+        top = ttk.LabelFrame(wrapper, text="Bot Controls", padding=8)
+        top.pack(fill="x", pady=(0, 10))
+
+        ttk.Label(top, text="Token:").grid(row=0, column=0, sticky="w")
+        ttk.Entry(top, textvariable=self.token_var, show="*", width=60).grid(row=0, column=1, padx=6, sticky="we")
+
+        ttk.Label(top, text="Prefix:").grid(row=0, column=2, padx=(10, 0), sticky="w")
+        ttk.Entry(top, textvariable=self.prefix_var, width=8).grid(row=0, column=3, padx=6, sticky="w")
+
+        ttk.Button(top, text="Start Bot", command=self.start_bot).grid(row=0, column=4, padx=4)
+        ttk.Button(top, text="Stop Bot", command=self.stop_bot).grid(row=0, column=5, padx=4)
+        top.columnconfigure(1, weight=1)
+
+        mid = ttk.Frame(wrapper)
+        mid.pack(fill="both", expand=True)
+
+        left = ttk.LabelFrame(mid, text="Keys", padding=8)
+        left.pack(side="left", fill="both", expand=True, padx=(0, 8))
+
+        ttk.Button(left, text="Load Keys File", command=self.load_keys).pack(anchor="w", pady=(0, 8))
+        ttk.Label(left, text="Default keys per request:").pack(anchor="w")
+        ttk.Entry(left, textvariable=self.default_count_var, width=10).pack(anchor="w", pady=(0, 8))
+        ttk.Button(left, text="Apply Default", command=self.apply_default_count).pack(anchor="w", pady=(0, 8))
+
+        self.keys_list = tk.Listbox(left)
+        self.keys_list.pack(fill="both", expand=True)
+
+        right = ttk.LabelFrame(mid, text="Allowed Users", padding=8)
+        right.pack(side="left", fill="both", expand=True)
+
+        row = ttk.Frame(right)
+        row.pack(fill="x", pady=(0, 8))
+        ttk.Entry(row, textvariable=self.user_id_var).pack(side="left", fill="x", expand=True, padx=(0, 6))
+        ttk.Button(row, text="Add", command=self.add_user).pack(side="left", padx=3)
+        ttk.Button(row, text="Remove", command=self.remove_user).pack(side="left", padx=3)
+
+        self.users_list = tk.Listbox(right)
+        self.users_list.pack(fill="both", expand=True)
+
+        bottom = ttk.LabelFrame(wrapper, text="State & Logs", padding=8)
+        bottom.pack(fill="both", expand=True, pady=(10, 0))
+
+        controls = ttk.Frame(bottom)
+        controls.pack(fill="x", pady=(0, 8))
+        ttk.Button(controls, text="Save State", command=self.save_state).pack(side="left", padx=(0, 6))
+        ttk.Button(controls, text="Load State", command=self.load_state).pack(side="left", padx=(0, 6))
+        self.stats_label = ttk.Label(controls, text="Remaining: 0 | Allowed: 0 | Claimed: 0")
+        self.stats_label.pack(side="right")
+
+        self.log_text = tk.Text(bottom, height=10, state="disabled")
+        self.log_text.pack(fill="both", expand=True)
+
+    def log(self, text: str):
+        self.log_text.configure(state="normal")
+        self.log_text.insert("end", text + "\n")
+        self.log_text.see("end")
+        self.log_text.configure(state="disabled")
+        self.refresh_lists()
+
+    def refresh_lists(self):
+        self.keys_list.delete(0, "end")
+        for k in self.dist.keys:
+            self.keys_list.insert("end", k)
+
+        self.users_list.delete(0, "end")
+        for uid in sorted(self.dist.allowed_users):
+            self.users_list.insert("end", str(uid))
+
+        s = self.dist.summary()
+        self.stats_label.config(
+            text=f"Remaining: {s['remaining']} | Allowed: {s['allowed_count']} | Claimed: {s['claimed_total']}"
+        )
+
+    def load_keys(self):
+        path = filedialog.askopenfilename(filetypes=[("Text files", "*.txt"), ("All files", "*.*")])
+        if not path:
+            return
+        try:
+            self.dist.load_keys_from_file(path)
+            self.log(f"Loaded keys from {path}")
+        except Exception as exc:
+            messagebox.showerror("Error", str(exc))
+
+    def apply_default_count(self):
+        try:
+            value = max(1, int(self.default_count_var.get()))
+            self.dist.default_count = value
+            self.log(f"Default key count set to {value}")
+        except ValueError:
+            messagebox.showwarning("Input Error", "Default count must be an integer.")
+
+    def add_user(self):
+        try:
+            uid = int(self.user_id_var.get().strip())
+            self.dist.add_allowed_user(uid)
+            self.log(f"Added allowed user {uid}")
+        except ValueError:
+            messagebox.showwarning("Input Error", "User ID must be a number.")
+
+    def remove_user(self):
+        try:
+            uid = int(self.user_id_var.get().strip())
+            self.dist.remove_allowed_user(uid)
+            self.log(f"Removed allowed user {uid}")
+        except ValueError:
+            messagebox.showwarning("Input Error", "User ID must be a number.")
+
+    def save_state(self):
+        path = filedialog.asksaveasfilename(defaultextension=".json", filetypes=[("JSON", "*.json")])
+        if not path:
+            return
+        try:
+            self.dist.save_state(path)
+            self.log(f"Saved state to {path}")
+        except Exception as exc:
+            messagebox.showerror("Error", str(exc))
+
+    def load_state(self):
+        path = filedialog.askopenfilename(filetypes=[("JSON", "*.json"), ("All files", "*.*")])
+        if not path:
+            return
+        try:
+            self.dist.load_state(path)
+            self.default_count_var.set(str(self.dist.default_count))
+            self.log(f"Loaded state from {path}")
+        except Exception as exc:
+            messagebox.showerror("Error", str(exc))
+
+    def start_bot(self):
+        token = self.token_var.get().strip()
+        prefix = self.prefix_var.get().strip() or "!"
+        if not token:
+            messagebox.showwarning("Missing Token", "Please enter your bot token.")
+            return
+        self.controller.start(token, prefix)
+
+    def stop_bot(self):
+        self.controller.stop()
+
+
+def main():
+    root = tk.Tk()
+    Dashboard(root)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
