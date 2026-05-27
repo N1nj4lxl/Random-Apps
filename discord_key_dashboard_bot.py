@@ -143,7 +143,7 @@ class BotController:
             except discord.Forbidden:
                 await ctx.reply("I can't DM you. Please open your DMs and try again.")
 
-            self.log_cb(f"Gave {len(keys)} key(s) to {ctx.author} ({ctx.author.id})")
+            self.log_cb(f"Gained keys -> {ctx.author} ({ctx.author.id}): {', '.join(keys)}")
 
         self._register_custom_commands(bot)
         return bot
@@ -209,10 +209,34 @@ class BotController:
 
 
 class Dashboard:
+    THEMES = {
+        "True Dark": {
+            "bg": "#0e0e10",
+            "panel": "#17171c",
+            "input": "#1f2027",
+            "text": "#f5f7ff",
+            "muted": "#adb5d8",
+            "accent": "#6c7bff",
+            "accent_active": "#8d98ff",
+            "border": "#2b2e3a",
+        },
+        "Dark Pink": {
+            "bg": "#140f16",
+            "panel": "#211725",
+            "input": "#2a1e30",
+            "text": "#ffeaf6",
+            "muted": "#ddb3cf",
+            "accent": "#ff4fa3",
+            "accent_active": "#ff79bc",
+            "border": "#3f2a47",
+        },
+    }
+
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title("Discord Key Distributor Dashboard")
         self.root.geometry("950x640")
+        self.style = ttk.Style(self.root)
 
         self.dist = KeyDistributor()
         self.controller = BotController(self.dist, self.log)
@@ -223,8 +247,10 @@ class Dashboard:
         self.user_id_var = tk.StringVar()
         self.command_name_var = tk.StringVar()
         self.command_response_var = tk.StringVar()
+        self.theme_var = tk.StringVar(value="True Dark")
 
         self._build_ui()
+        self.apply_theme(self.theme_var.get())
         self.refresh_lists()
 
     def _build_ui(self):
@@ -242,6 +268,16 @@ class Dashboard:
 
         ttk.Button(top, text="Start Bot", command=self.start_bot).grid(row=0, column=4, padx=4)
         ttk.Button(top, text="Stop Bot", command=self.stop_bot).grid(row=0, column=5, padx=4)
+        ttk.Label(top, text="Theme:").grid(row=1, column=0, pady=(8, 0), sticky="w")
+        theme_combo = ttk.Combobox(
+            top,
+            textvariable=self.theme_var,
+            values=list(self.THEMES.keys()),
+            state="readonly",
+            width=14,
+        )
+        theme_combo.grid(row=1, column=1, sticky="w", padx=6, pady=(8, 0))
+        theme_combo.bind("<<ComboboxSelected>>", lambda _e: self.apply_theme(self.theme_var.get()))
         top.columnconfigure(1, weight=1)
 
         mid = ttk.Frame(wrapper)
@@ -286,6 +322,11 @@ class Dashboard:
         self.commands_list = tk.Listbox(commands_frame)
         self.commands_list.pack(fill="both", expand=True)
 
+        gained_frame = ttk.LabelFrame(mid, text="Users Who Gained Keys", padding=8)
+        gained_frame.pack(side="left", fill="both", expand=True, padx=(8, 0))
+        self.gained_list = tk.Listbox(gained_frame)
+        self.gained_list.pack(fill="both", expand=True)
+
         bottom = ttk.LabelFrame(wrapper, text="State & Logs", padding=8)
         bottom.pack(fill="both", expand=True, pady=(10, 0))
 
@@ -298,6 +339,55 @@ class Dashboard:
 
         self.log_text = tk.Text(bottom, height=10, state="disabled")
         self.log_text.pack(fill="both", expand=True)
+
+    def apply_theme(self, theme_name: str):
+        c = self.THEMES[theme_name]
+        self.style.theme_use("clam")
+        self.root.configure(bg=c["bg"])
+
+        self.style.configure("TFrame", background=c["bg"])
+        self.style.configure("TLabelframe", background=c["panel"], bordercolor=c["border"], relief="solid")
+        self.style.configure("TLabelframe.Label", background=c["panel"], foreground=c["text"])
+        self.style.configure("TLabel", background=c["panel"], foreground=c["text"])
+        self.style.configure("TEntry", fieldbackground=c["input"], foreground=c["text"], bordercolor=c["border"])
+        self.style.map("TEntry", fieldbackground=[("readonly", c["input"])])
+        self.style.configure(
+            "TButton",
+            background=c["accent"],
+            foreground="white",
+            borderwidth=0,
+            focusthickness=0,
+            padding=6,
+        )
+        self.style.map("TButton", background=[("active", c["accent_active"])])
+        self.style.configure(
+            "TCombobox",
+            fieldbackground=c["input"],
+            background=c["input"],
+            foreground=c["text"],
+            arrowcolor=c["text"],
+        )
+        self.style.map("TCombobox", fieldbackground=[("readonly", c["input"])])
+
+        for listbox in [self.keys_list, self.users_list, self.commands_list, self.gained_list]:
+            listbox.configure(
+                bg=c["input"],
+                fg=c["text"],
+                selectbackground=c["accent"],
+                selectforeground="white",
+                highlightthickness=1,
+                highlightbackground=c["border"],
+                relief="flat",
+            )
+
+        self.log_text.configure(
+            bg=c["input"],
+            fg=c["text"],
+            insertbackground=c["text"],
+            highlightthickness=1,
+            highlightbackground=c["border"],
+            relief="flat",
+        )
 
     def log(self, text: str):
         self.log_text.configure(state="normal")
@@ -318,6 +408,11 @@ class Dashboard:
         self.commands_list.delete(0, "end")
         for name, response in sorted(self.dist.custom_commands.items()):
             self.commands_list.insert("end", f"{name} -> {response}")
+
+        self.gained_list.delete(0, "end")
+        for uid, keys in sorted(self.dist.claimed.items()):
+            if keys:
+                self.gained_list.insert("end", f"{uid} ({len(keys)} key(s))")
 
         s = self.dist.summary()
         self.stats_label.config(
